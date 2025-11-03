@@ -1,0 +1,38 @@
+name: Docker Build and Test
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+    
+    - name: Build API image
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        file: ./Dockerfile
+        push: false
+        tags: dojo-allocator-api:test
+        cache-from: type=registry,ref=dojo-allocator-api:latest
+        cache-to: type=inline
+    
+    - name: Build Dashboard image
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        file: ./Dockerfile.dashboard
+        push: false
+        tags: dojo-allocator-dashboard:test
+        cache-from: type=registry,ref=dojo-allocator-dashboard:latest
+        cache-to: type=inline
+
