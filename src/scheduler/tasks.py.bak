@@ -1,0 +1,390 @@
+"""
+Celery background tasks.
+"""
+from celery import Task
+from src.scheduler.celery_app import app
+from src.models.base import SessionLocal
+from src.models.signals import Signal
+from src.models.positions import Position
+from src.data.stock_act import StockActFetcher
+from src.data.transformers import SignalTransformer
+from src.core.signal_scorer import SignalScorer
+from src.core.allocator import Allocator
+from src.core.round_manager import RoundManager
+from src.execution.paper_broker import PaperBroker
+from src.execution.order_manager import OrderManager
+from src.utils.logging import get_logger
+from datetime import datetime
+from decimal import Decimal
+import uuid
+
+logger = get_logger(__name__)
+
+
+class DatabaseTask(Task):
+    """Base task with database session management."""
+    _db = None
+    
+    @property
+    def db(self):
+        if self._db is None:
+            self._db = SessionLocal()
+        return self._db
+    
+    def after_return(self, *args, **kwargs):
+        if self._db is not None:
+            self._db.close()
+            self._db = None
+
+
+@app.task(base=DatabaseTask, bind=True)
+def ingest_all_data(self):
+    """
+    Daily task: Ingest data from all sources.
+    Runs at 6 AM UTC.
+    """
+    logger.info("Starting data ingestion")
+    
+    db = self.db
+    
+    try:
+        # Fetch congressional trades
+        fetcher = StockActFetcher()
+        trades = fetcher.fetch_recent_trades()
+        signals_data = fetcher.transform_to_signal_format(trades)
+        
+        logger.info(f"Fetched {len(signals_data)} signals from STOCK Act")
+        # Fetch OpenInsider congressional trades
+        from src.data.openinsider import OpenInsiderFetcher
+        oi_fetcher = OpenInsiderFetcher()
+        oi_trades = oi_fetcher.fetch_congressional_trades(limit=100)
+        oi_signals = oi_fetcher.transform_to_signal_format(oi_trades)
+        logger.info(f"OpenInsider: {len(oi_signals)} congressional signals")
+        
+        # Combine all signals
+        signals_data = signals_data + oi_signals        
+
+        added = 0
+        duplicates = 0
+        
+        for signal_data in signals_data:
+            # Check for duplicates
+            existing = db.query(Signal).filter(
+                Signal.symbol == signal_data['symbol'],
+                Signal.source == signal_data['source'],
+                Signal.transaction_date == signal_data['transaction_date']
+            ).first()
+            
+            if existing:
+                duplicates += 1
+                continue
+            
+            # Create signal
+            signal_id = f"{signal_data['source']}_{signal_data['symbol']}_{uuid.uuid4().hex[:8]}"
+            
+            signal = Signal(
+                signal_id=signal_id,
+                source=signal_data['source'],
+                symbol=signal_data['symbol'],
+                direction=signal_data['direction'],
+                filer_name=signal_data['filer_name'],
+                transaction_date=signal_data['transaction_date'],
+                filing_date=signal_data['filing_date'],
+                transaction_value=signal_data['transaction_value'],
+                status='PENDING',
+                raw_data=signal_data.get('raw_data', {})
+            )
+            
+            db.add(signal)
+            added += 1
+        
+        db.commit()
+        
+        logger.info(f"Data ingestion complete: {added} added, {duplicates} duplicates")
+        return {"added": added, "duplicates": duplicates}
+        
+    except Exception as e:
+        logger.error(f"Data ingestion failed: {e}")
+        db.rollback()
+        raise
+
+
+@app.task(base=DatabaseTask, bind=True)
+def score_all_signals(self):
+    """
+    Daily task: Score all pending signals.
+    Runs at 7 AM UTC.
+    """
+    logger.info("Starting signal scoring")
+    
+    db = self.db
+    scorer = SignalScorer(db)
+    
+    try:
+        # Get all pending signals
+        pending_signals = db.query(Signal).filter(
+            Signal.status == 'PENDING'
+        ).all()
+        
+        logger.info(f"Scoring {len(pending_signals)} pending signals")
+        
+        scored = 0
+        rejected = 0
+        
+        for signal in pending_signals:
+            # Find similar signals
+            similar = db.query(Signal).filter(
+                Signal.symbol == signal.symbol,
+                Signal.direction == signal.direction,
+                Signal.status == 'ACTIVE'
+            ).all()
+            
+            # Score signal
+            factors = scorer.score_signal(
+                signal={
+                    'signal_id': signal.signal_id,
+                    'filing_date': signal.filing_date,
+                    'transaction_value': signal.transaction_value,
+                    'symbol': signal.symbol,
+                    'filer_cik': None
+                },
+                similar_signals=similar,
+                filer_history=None
+            )
+            
+            # Update signal
+            signal.recency_score = factors.recency_score
+            signal.size_score = factors.size_score
+            signal.competence_score = factors.competence_score
+            signal.consensus_score = factors.consensus_score
+            signal.regime_score = factors.regime_score
+            
+            total_score = scorer.calculate_total_score(factors)
+            signal.total_score = total_score
+            
+            tier = scorer.assign_tier(total_score)
+            signal.conviction_tier = tier
+            
+            if tier == 'REJECT':
+                signal.status = 'REJECTED'
+                rejected += 1
+            else:
+                signal.status = 'ACTIVE'
+                scored += 1
+        
+        db.commit()
+        
+        logger.info(f"Signal scoring complete: {scored} scored, {rejected} rejected")
+        return {"scored": scored, "rejected": rejected}
+        
+    except Exception as e:
+        logger.error(f"Signal scoring failed: {e}")
+        db.rollback()
+        raise
+
+
+@app.task(base=DatabaseTask, bind=True)
+def allocate_and_execute(self):
+    """
+    Daily task: Allocate capital and execute trades.
+    Runs at 8 AM UTC.
+    """
+    logger.info("Starting capital allocation")
+    
+    db = self.db
+    
+    try:
+        # Get active signals
+        active_signals = db.query(Signal).filter(
+            Signal.status == 'ACTIVE'
+        ).order_by(Signal.total_score.desc()).limit(20).all()
+        
+        logger.info(f"Found {len(active_signals)} active signals")
+        
+        if not active_signals:
+            logger.info("No active signals to allocate")
+            return {"allocated": 0}
+        
+        # Get open positions
+        open_positions = db.query(Position).filter(
+            Position.status == 'OPEN'
+        ).all()
+        
+        # Initialize components
+        allocator = Allocator()
+        broker = PaperBroker()
+        broker.connect()
+        
+        # Get current portfolio value
+        portfolio_value = broker.get_account_value()
+        
+        # Get allocation power (default to 1.0)
+        allocation_power = 1.0
+        
+        # Allocate capital
+        decisions = allocator.allocate_capital(
+            signals=active_signals,
+            current_portfolio_value=portfolio_value,
+            open_positions=open_positions,
+            allocation_power=allocation_power
+        )
+        
+        logger.info(f"Generated {len(decisions)} allocation decisions")
+        
+        # Execute decisions
+        order_manager = OrderManager(db, broker)
+        round_manager = RoundManager(db)
+        
+        executed = 0
+        
+        for decision in decisions:
+            # Create position
+            round_params = round_manager.create_round(
+                signal=db.query(Signal).filter(
+                    Signal.signal_id == decision.signal_id
+                ).first(),
+                allocation=decision.__dict__
+            )
+            
+            position = Position(
+                position_id=f'POS_{uuid.uuid4().hex[:16]}',
+                symbol=decision.symbol,
+                direction=decision.direction,
+                shares=decision.shares,
+                entry_date=datetime.utcnow(),
+                conviction_tier=decision.conviction_tier,
+                philosophy_applied=decision.philosophy_applied,
+                source_signals=[decision.signal_id],
+                round_start=round_params['round_start'],
+                round_expiry=round_params['round_expiry'],
+                status='PENDING'
+            )
+            
+            db.add(position)
+            db.commit()
+            
+            # Create and execute entry order
+            entry_order = order_manager.create_entry_order(
+                allocation=decision.__dict__,
+                position_id=position.position_id
+            )
+            
+            success = order_manager.execute_order(entry_order)
+            
+            if success:
+                executed += 1
+                logger.info(f"Position opened: {position.position_id}")
+        
+        broker.disconnect()
+        
+        logger.info(f"Capital allocation complete: {executed} positions opened")
+        return {"allocated": executed}
+        
+    except Exception as e:
+        logger.error(f"Capital allocation failed: {e}")
+        db.rollback()
+        raise
+
+
+@app.task(base=DatabaseTask, bind=True)
+def check_position_expiry(self):
+    """
+    Hourly task: Check for expired positions and close them.
+    """
+    logger.info("Checking position expiry")
+    
+    db = self.db
+    round_manager = RoundManager(db)
+    
+    try:
+        # Force close expired positions
+        expired = round_manager.force_close_expired()
+        
+        if expired:
+            # Execute exit orders
+            broker = PaperBroker()
+            broker.connect()
+            order_manager = OrderManager(db, broker)
+            
+            for position in expired:
+                exit_order = order_manager.create_exit_order(
+                    position=position,
+                    reason='EXPIRY'
+                )
+                order_manager.execute_order(exit_order)
+            
+            broker.disconnect()
+        
+        logger.info(f"Position expiry check complete: {len(expired)} closed")
+        return {"closed": len(expired)}
+        
+    except Exception as e:
+        logger.error(f"Position expiry check failed: {e}")
+        raise
+
+
+@app.task(base=DatabaseTask, bind=True)
+def end_of_day_reconciliation(self):
+    """
+    Daily task: End-of-day reconciliation and reporting.
+    Runs at 10 PM UTC.
+    """
+    logger.info("Starting end-of-day reconciliation")
+    
+    db = self.db
+    
+    try:
+        # Count signals
+        total_signals = db.query(Signal).count()
+        active_signals = db.query(Signal).filter(Signal.status == 'ACTIVE').count()
+        
+        # Count positions
+        open_positions = db.query(Position).filter(Position.status == 'OPEN').count()
+        closed_today = db.query(Position).filter(
+            Position.status == 'CLOSED',
+            Position.exit_date >= datetime.utcnow().date()
+        ).count()
+        
+        logger.info(
+            f"EOD Summary: {total_signals} signals ({active_signals} active), "
+            f"{open_positions} open positions, {closed_today} closed today"
+        )
+        
+        return {
+            "total_signals": total_signals,
+            "active_signals": active_signals,
+            "open_positions": open_positions,
+            "closed_today": closed_today
+        }
+        
+    except Exception as e:
+        logger.error(f"EOD reconciliation failed: {e}")
+        raise
+
+@celery_app.task(name="backup_database")
+def backup_database():
+    """Daily database backup to Google Drive"""
+    import subprocess
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    logger.info("Starting scheduled database backup...")
+    
+    try:
+        result = subprocess.run(
+            ["bash", "/app/scripts/backup_database.sh"],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        
+        if result.returncode == 0:
+            logger.info(f"Backup successful: {result.stdout}")
+            return {"status": "success", "output": result.stdout}
+        else:
+            logger.error(f"Backup failed: {result.stderr}")
+            return {"status": "error", "output": result.stderr}
+            
+    except Exception as e:
+        logger.error(f"Backup task error: {e}")
+        return {"status": "error", "message": str(e)}

@@ -1,0 +1,202 @@
+"""
+FastAPI application entry point.
+"""
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from src.api.routes import signals, positions, orders, health
+
+app = FastAPI(
+    title="Dojo Allocator API",
+    description="Autonomous trading system API",
+    version="1.0.0"
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Include routers
+app.include_router(health.router, tags=["Health"])
+app.include_router(signals.router, prefix="/signals", tags=["Signals"])
+app.include_router(positions.router, prefix="/positions", tags=["Positions"])
+app.include_router(orders.router, prefix="/orders", tags=["Orders"])
+
+@app.get("/")
+def root():
+    """Root endpoint."""
+    return {
+        "name": "Dojo Allocator API",
+        "version": "1.0.0",
+        "docs": "/docs"
+    }
+
+
+@app.post("/backup/create")
+async def create_backup():
+    """Create database backup"""
+    import subprocess
+    import os
+    from datetime import datetime
+    
+    try:
+        backup_dir = "/mnt/user-data/backups"
+        os.makedirs(backup_dir, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_file = f"{backup_dir}/dojo_backup_{timestamp}.sql"
+        
+        result = subprocess.run(
+            ["pg_dump", "-h", "postgres", "-U", "dojo", "dojo_allocator"],
+            capture_output=True,
+            text=True,
+            env={"PGPASSWORD": "password"}
+        )
+        
+        if result.returncode == 0:
+            with open(backup_file, "w") as f:
+                f.write(result.stdout)
+            subprocess.run(["gzip", backup_file])
+            return {"status": "success", "file": f"dojo_backup_{timestamp}.sql.gz"}
+        else:
+            return {"status": "error", "message": result.stderr}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/backup/list")
+async def list_backups():
+    """List available backups"""
+    import glob
+    import os
+    
+    backup_dir = "/mnt/user-data/backups"
+    try:
+        files = glob.glob(f"{backup_dir}/dojo_backup_*.sql.gz")
+        files.sort(reverse=True)
+        
+        backups = []
+        for f in files:
+            stat = os.stat(f)
+            backups.append({
+                "filename": os.path.basename(f),
+                "size": stat.st_size,
+                "created": stat.st_mtime
+            })
+        return {"backups": backups, "count": len(backups)}
+    except Exception as e:
+        return {"backups": [], "count": 0, "error": str(e)}
+
+
+@app.get("/export/signals")
+async def export_signals_csv():
+    """Export all signals to CSV"""
+    from fastapi.responses import StreamingResponse
+    from io import StringIO
+    import csv
+    from src.models.base import SessionLocal
+    from src.models.signals import Signal
+    
+    db = SessionLocal()
+    try:
+        signals = db.query(Signal).all()
+        
+        output = StringIO()
+        writer = csv.writer(output)
+        
+        # Header
+        writer.writerow([
+            'signal_id', 'symbol', 'direction', 'source', 'filer_name',
+            'transaction_date', 'filing_date', 'transaction_value',
+            'conviction_tier', 'total_score', 'status', 'created_at'
+        ])
+        
+        # Data
+        for s in signals:
+            writer.writerow([
+                s.signal_id,
+                s.symbol,
+                s.direction,
+                s.source,
+                s.filer_name,
+                s.transaction_date.strftime('%Y-%m-%d') if s.transaction_date else '',
+                s.filing_date.strftime('%Y-%m-%d') if s.filing_date else '',
+                float(s.transaction_value) if s.transaction_value else '',
+                s.conviction_tier or '',
+                float(s.total_score) if s.total_score else '',
+                s.status,
+                s.created_at.strftime('%Y-%m-%d %H:%M:%S') if s.created_at else ''
+            ])
+        
+        output.seek(0)
+        
+        from datetime import datetime
+        filename = f"dojo_signals_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    finally:
+        db.close()
+
+@app.get("/export/positions")
+async def export_positions_csv():
+    """Export all positions to CSV"""
+    from fastapi.responses import StreamingResponse
+    from io import StringIO
+    import csv
+    from src.models.base import SessionLocal
+    from src.models.positions import Position
+    
+    db = SessionLocal()
+    try:
+        positions = db.query(Position).all()
+        
+        output = StringIO()
+        writer = csv.writer(output)
+        
+        # Header
+        writer.writerow([
+            'position_id', 'signal_id', 'symbol', 'direction', 'shares',
+            'entry_price', 'exit_price', 'entry_date', 'exit_date',
+            'conviction_tier', 'realized_pnl', 'unrealized_pnl', 
+            'return_pct', 'status'
+        ])
+        
+        # Data
+        for p in positions:
+            writer.writerow([
+                p.position_id,
+                p.signal_id,
+                p.symbol,
+                p.direction,
+                float(p.shares) if p.shares else '',
+                float(p.entry_price) if p.entry_price else '',
+                float(p.exit_price) if p.exit_price else '',
+                p.entry_date.strftime('%Y-%m-%d %H:%M:%S') if p.entry_date else '',
+                p.exit_date.strftime('%Y-%m-%d %H:%M:%S') if p.exit_date else '',
+                p.conviction_tier or '',
+                float(p.realized_pnl) if p.realized_pnl else '',
+                float(p.unrealized_pnl) if p.unrealized_pnl else '',
+                float(p.return_pct) if p.return_pct else '',
+                p.status
+            ])
+        
+        output.seek(0)
+        
+        from datetime import datetime
+        filename = f"dojo_positions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    finally:
+        db.close()
+

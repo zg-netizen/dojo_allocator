@@ -1,0 +1,267 @@
+"""
+Order lifecycle management and tracking.
+Coordinates between allocation decisions and broker execution.
+"""
+from datetime import datetime
+from decimal import Decimal
+from typing import Dict, List
+from sqlalchemy.orm import Session
+import uuid
+
+from src.execution.base_broker import (
+    BaseBroker, OrderRequest, OrderSide, OrderType, OrderStatus
+)
+from src.models.orders import Order
+from src.models.positions import Position as DBPosition
+from src.models.audit_log import AuditLog
+from src.utils.logging import get_logger
+from src.utils.hashing import create_event_hash
+
+logger = get_logger(__name__)
+
+class OrderManager:
+    """Manages order lifecycle from creation through execution."""
+    
+    def __init__(self, db: Session, broker: BaseBroker):
+        self.db = db
+        self.broker = broker
+    
+    def create_entry_order(self, allocation: Dict, position_id: str) -> Order:
+        """Create order to enter a new position."""
+        order_id = str(uuid.uuid4())
+        side = 'BUY' if allocation['direction'] == 'LONG' else 'SELL'
+        
+        order = Order(
+            order_id=order_id,
+            position_id=position_id,
+            symbol=allocation['symbol'],
+            side=side,
+            order_type='MARKET',
+            quantity=allocation['shares'],
+            status='PENDING',
+            created_at=datetime.utcnow()
+        )
+        
+        self.db.add(order)
+        self.db.commit()
+        
+        logger.info(
+            "Entry order created",
+            order_id=order_id,
+            symbol=allocation['symbol'],
+            side=side,
+            quantity=allocation['shares']
+        )
+        
+        self._create_audit_log(
+            event_type='ORDER_CREATED',
+            entity_type='order',
+            entity_id=order_id,
+            after_state=self._order_to_dict(order)
+        )
+        
+        return order
+    
+    def create_exit_order(self, position: DBPosition, reason: str = 'EXPIRY') -> Order:
+        """Create order to exit an existing position."""
+        order_id = str(uuid.uuid4())
+        exit_side = 'SELL' if position.direction == 'LONG' else 'BUY'
+        
+        order = Order(
+            order_id=order_id,
+            position_id=position.position_id,
+            symbol=position.symbol,
+            side=exit_side,
+            order_type='MARKET',
+            quantity=position.shares,
+            status='PENDING',
+            created_at=datetime.utcnow()
+        )
+        
+        self.db.add(order)
+        self.db.commit()
+        
+        logger.info(
+            "Exit order created",
+            order_id=order_id,
+            position_id=position.position_id,
+            symbol=position.symbol,
+            reason=reason
+        )
+        
+        self._create_audit_log(
+            event_type='ORDER_CREATED',
+            entity_type='order',
+            entity_id=order_id,
+            after_state=self._order_to_dict(order)
+        )
+        
+        return order
+    
+    def execute_order(self, order: Order) -> bool:
+        """Submit order to broker and track execution."""
+        logger.info(
+            "Executing order",
+            order_id=order.order_id,
+            symbol=order.symbol,
+            side=order.side,
+            quantity=order.quantity
+        )
+        
+        broker_request = OrderRequest(
+            symbol=order.symbol,
+            side=OrderSide(order.side),
+            quantity=order.quantity,
+            order_type=OrderType(order.order_type),
+            limit_price=order.limit_price,
+            stop_price=order.stop_price
+        )
+        
+        try:
+            response = self.broker.submit_order(broker_request)
+            
+            order.broker_order_id = response.broker_order_id
+            order.status = response.status.value
+            order.filled_qty = response.filled_qty
+            order.filled_avg_price = response.filled_avg_price
+            order.commission = response.commission
+            order.submitted_at = response.timestamp
+            
+            if response.status == OrderStatus.FILLED:
+                order.filled_at = response.timestamp
+            
+            if response.error_message:
+                order.error_message = response.error_message
+            
+            self.db.commit()
+            
+            logger.info(
+                "Order executed",
+                order_id=order.order_id,
+                broker_order_id=response.broker_order_id,
+                status=response.status,
+                filled_qty=response.filled_qty,
+                fill_price=float(response.filled_avg_price) if response.filled_avg_price else None
+            )
+            
+            self._create_audit_log(
+                event_type='ORDER_EXECUTED',
+                entity_type='order',
+                entity_id=order.order_id,
+                after_state=self._order_to_dict(order)
+            )
+            
+            if response.status == OrderStatus.FILLED:
+                self._update_position_on_fill(order, response)
+            
+            return response.status in [OrderStatus.FILLED, OrderStatus.SUBMITTED]
+            
+        except Exception as e:
+            logger.error("Order execution failed", order_id=order.order_id, error=str(e))
+            order.status = 'REJECTED'
+            order.error_message = str(e)
+            self.db.commit()
+            return False
+    
+    def _update_position_on_fill(self, order: Order, response):
+        """Update position record when order fills."""
+        position = self.db.query(DBPosition).filter(
+            DBPosition.position_id == order.position_id
+        ).first()
+        
+        if not position:
+            logger.error("Position not found for order", order_id=order.order_id, position_id=order.position_id)
+            return
+        
+        if order.side in ['BUY', 'LONG']:
+            # Entry order filled
+            position.entry_price = response.filled_avg_price
+            position.entry_value = response.filled_avg_price * Decimal(response.filled_qty)
+            position.status = 'OPEN'
+            
+            logger.info(
+                "Position opened",
+                position_id=position.position_id,
+                symbol=position.symbol,
+                entry_price=float(response.filled_avg_price),
+                entry_value=float(position.entry_value)
+            )
+        else:
+            # Exit order filled
+            position.exit_date = datetime.utcnow()
+            position.exit_price = response.filled_avg_price
+            position.exit_value = response.filled_avg_price * Decimal(response.filled_qty)
+            
+            if position.direction == 'LONG':
+                position.realized_pnl = position.exit_value - position.entry_value
+            else:
+                position.realized_pnl = position.entry_value - position.exit_value
+            
+            position.return_pct = position.realized_pnl / position.entry_value
+            position.status = 'CLOSED'
+            
+            logger.info(
+                "Position closed",
+                position_id=position.position_id,
+                symbol=position.symbol,
+                exit_price=float(response.filled_avg_price),
+                realized_pnl=float(position.realized_pnl),
+                return_pct=float(position.return_pct)
+            )
+            
+            self._create_audit_log(
+                event_type='POSITION_CLOSED',
+                entity_type='position',
+                entity_id=position.position_id,
+                after_state={
+                    'position_id': position.position_id,
+                    'realized_pnl': float(position.realized_pnl),
+                    'return_pct': float(position.return_pct),
+                    'status': 'CLOSED'
+                }
+            )
+        
+        self.db.commit()
+    
+    def _order_to_dict(self, order: Order) -> Dict:
+        """Convert order to dict with JSON-serializable types."""
+        return {
+            'order_id': order.order_id,
+            'symbol': order.symbol,
+            'side': order.side,
+            'quantity': int(order.quantity) if order.quantity else None,
+            'status': order.status,
+            'filled_qty': int(order.filled_qty) if order.filled_qty else None,
+            'filled_avg_price': float(order.filled_avg_price) if order.filled_avg_price else None,
+            'commission': float(order.commission) if order.commission else None
+        }
+    
+    def _create_audit_log(self, event_type: str, entity_type: str, entity_id: str, after_state: Dict, before_state: Dict = None):
+        """Create immutable audit log entry."""
+        timestamp = datetime.utcnow()
+        
+        last_log = self.db.query(AuditLog).order_by(AuditLog.timestamp.desc()).first()
+        previous_hash = last_log.event_hash if last_log else "GENESIS"
+        
+        event_hash = create_event_hash(
+            timestamp=timestamp,
+            event_type=event_type,
+            entity_id=entity_id,
+            after_state=after_state
+        )
+        
+        audit_log = AuditLog(
+            timestamp=timestamp,
+            event_type=event_type,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            actor='SYSTEM',
+            action=event_type,
+            before_state=before_state,
+            after_state=after_state,
+            event_hash=event_hash,
+            previous_hash=previous_hash
+        )
+        
+        self.db.add(audit_log)
+        self.db.commit()

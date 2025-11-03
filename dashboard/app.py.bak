@@ -1,0 +1,510 @@
+"""Streamlit dashboard for Dojo Allocator."""
+import streamlit as st
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+import pandas as pd
+from config.settings import get_settings
+import requests
+import yfinance as yf
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+
+settings = get_settings()
+engine = create_engine(settings.DATABASE_URL)
+Session = sessionmaker(bind=engine)
+
+st.set_page_config(page_title="Dojo Allocator", layout="wide")
+st.title("🥋 Dojo Allocator Dashboard")
+
+# Sidebar
+st.sidebar.title("Navigation")
+page = st.sidebar.radio("Go to", ["Overview", "Performance", "Signals", "Positions"])
+
+db = Session()
+
+# Helper functions for Performance page
+# This is the new fetch function to replace the old one
+
+def fetch_benchmark_data(ticker, days):
+    """Fetch benchmark data using Alpaca API"""
+    import os
+    import requests
+    import pandas as pd
+    from datetime import datetime, timedelta
+    
+    try:
+        API_KEY = os.getenv("ALPACA_API_KEY")
+        API_SECRET = os.getenv("ALPACA_API_SECRET")
+        
+        if not API_KEY:
+            return pd.Series()
+        
+        fetch_days = max(days, 10)
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=fetch_days)
+        
+        url = "https://data.alpaca.markets/v2/stocks/bars"
+        params = {
+            "symbols": ticker,
+            "start": start_date.strftime("%Y-%m-%d"),
+            "end": end_date.strftime("%Y-%m-%d"),
+            "timeframe": "1Day",
+            "feed": "iex"
+        }
+        headers = {
+            "APCA-API-KEY-ID": API_KEY,
+            "APCA-API-SECRET-KEY": API_SECRET
+        }
+        
+        response = requests.get(url, params=params, headers=headers, timeout=10)
+        
+        if response.status_code != 200:
+            return pd.Series()
+        
+        data = response.json()
+        bars = data.get("bars", {}).get(ticker, [])
+        
+        print(f"[FETCH] {ticker}: status={response.status_code}, bars={len(bars)}")
+        
+        if not bars:
+            print(f"[FETCH] {ticker}: NO BARS RETURNED")
+            return pd.Series()
+        
+        df = pd.DataFrame(bars)
+        df["t"] = pd.to_datetime(df["t"])
+        df = df.set_index("t")
+        df = df.sort_index()
+        
+        if days < fetch_days:
+            cutoff = end_date - timedelta(days=days)
+            df = df[df.index >= cutoff]
+        
+        return df["c"]
+        
+    except Exception as e:
+        return pd.Series()
+
+def calculate_portfolio_history(db, days):
+    """Calculate portfolio value over time"""
+    try:
+        positions = db.execute(text("""
+            SELECT entry_date, shares, entry_price, symbol
+            FROM positions 
+            WHERE status = :status
+            ORDER BY entry_date
+        """), {"status": "OPEN"}).fetchall()
+        
+        portfolio_data = []
+        cumulative_value = 0
+        
+        for pos in positions:
+            cumulative_value += float(pos[1]) * float(pos[2])
+            portfolio_data.append({
+                "date": pos[0],
+                "value": cumulative_value + (100000 - cumulative_value)
+            })
+        
+        if portfolio_data:
+            df = pd.DataFrame(portfolio_data)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.set_index("date")
+            return df["value"]
+        else:
+            return pd.Series()
+    except:
+        return pd.Series()
+
+if page == "Overview":
+    st.header("System Overview")
+    
+    # Get portfolio stats
+    try:
+        response = requests.get("http://api:8000/positions/stats/summary", timeout=5)
+        portfolio_stats = response.json() if response.status_code == 200 else {}
+    except:
+        portfolio_stats = {}
+    
+    # Calculate portfolio value
+    portfolio_value = 100000.0
+    try:
+        positions_value = db.execute(text("""
+            SELECT COALESCE(SUM(shares * COALESCE(entry_price, 0)), 0) as deployed
+            FROM positions WHERE status = :status
+        """), {"status": "OPEN"}).fetchone()[0]
+        positions_value = float(positions_value) if positions_value else 0
+        cash_available = portfolio_value - positions_value
+        deployment_pct = (positions_value / portfolio_value) * 100 if portfolio_value > 0 else 0
+    except:
+        positions_value = 0
+        cash_available = portfolio_value
+        deployment_pct = 0
+    
+    # Top row: Financial metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Portfolio Value", f"${portfolio_value:,.0f}", "Paper Trading")
+    
+    with col2:
+        st.metric("Deployed Capital", f"${positions_value:,.0f}", f"{deployment_pct:.1f}%")
+    
+    with col3:
+        st.metric("Cash Available", f"${cash_available:,.0f}", f"{100-deployment_pct:.1f}%")
+    
+    with col4:
+        total_pnl = portfolio_stats.get("total_pnl", 0)
+        pnl_pct = (total_pnl/portfolio_value)*100 if portfolio_value > 0 else 0
+        st.metric("Total P&L", f"${total_pnl:,.2f}", f"{pnl_pct:.2f}%")
+    
+    # Second row: Position metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        total_signals = db.execute(text("SELECT COUNT(*) FROM signals")).scalar()
+        st.metric("Total Signals", total_signals)
+    
+    with col2:
+        active_signals = db.execute(text("SELECT COUNT(*) FROM signals WHERE status=:status"), {"status": "ACTIVE"}).scalar()
+        st.metric("Active Signals", active_signals)
+    
+    with col3:
+        open_positions = db.execute(text("SELECT COUNT(*) FROM positions WHERE status=:status"), {"status": "OPEN"}).scalar()
+        st.metric("Open Positions", open_positions)
+    
+    with col4:
+        closed_positions = db.execute(text("SELECT COUNT(*) FROM positions WHERE status=:status"), {"status": "CLOSED"}).scalar()
+        st.metric("Closed Positions", closed_positions)
+    
+    
+    # Database Backup
+    st.divider()
+    st.subheader("💾 Database Backup")
+    
+    col1, col2, col3 = st.columns([2, 1, 1])
+    
+    with col1:
+        st.write("**Automatic:** Daily at 2 AM")
+        st.write("**Location:** Google Drive → Dojo Backups")
+        
+    with col2:
+        if st.button("🔄 Backup Now", type="primary"):
+            with st.spinner("Creating backup..."):
+                import requests
+                try:
+                    response = requests.post("http://api:8000/backup/create", timeout=30)
+                    if response.status_code == 200:
+                        data = response.json()
+                        if data.get("status") == "success":
+                            st.success(f"✅ Saved: {data.get('file')}")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ {data.get('message', 'Failed')}")
+                    else:
+                        st.error("❌ API error")
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)[:50]}")
+    
+    with col3:
+        import requests
+        try:
+            response = requests.get("http://api:8000/backup/list", timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                st.metric("Backups", data.get("count", 0))
+            else:
+                st.metric("Backups", "?")
+        except:
+            st.metric("Backups", "?")
+    
+    try:
+        import glob
+        from datetime import datetime
+        backup_files = glob.glob(f"{backup_dir}/dojo_backup_*.sql.gz")
+        backup_files.sort(reverse=True)
+        
+        if backup_files[:3]:
+            with st.expander("📦 Recent backups"):
+                for backup in backup_files[:3]:
+                    filename = os.path.basename(backup)
+                    size = os.path.getsize(backup) / 1024
+                    mtime = os.path.getmtime(backup)
+                    date = datetime.fromtimestamp(mtime).strftime("%b %d %I:%M%p")
+                    st.caption(f"{filename} • {size:.0f}KB • {date}")
+    except:
+        pass
+
+    st.subheader("Active Signals")
+    
+    # Data Export
+    st.divider()
+    st.subheader("📥 Export Data")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**Export Signals**")
+        st.caption("Download all signals as CSV")
+        if st.button("📊 Export Signals", key="export_signals_btn"):
+            import requests
+            with st.spinner("Exporting..."):
+                try:
+                    response = requests.post("http://api:8000/export/signals", timeout=30)
+                    if response.status_code == 200:
+                        data = response.json()
+                        st.success(f"✅ Exported {data['count']} signals to Google Drive!")
+                        st.caption(f"📁 {data['location']}/{data['filename']}")
+                    else:
+                        st.error("❌ Export failed")
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)[:50]}")
+    
+    with col2:
+        st.write("**Export Positions**")
+        st.caption("Download all positions as CSV")
+        if st.button("📈 Export Positions", key="export_positions_btn"):
+            import requests
+            with st.spinner("Exporting..."):
+                try:
+                    response = requests.post("http://api:8000/export/positions", timeout=30)
+                    if response.status_code == 200:
+                        data = response.json()
+                        st.success(f"✅ Exported {data['count']} positions to Google Drive!")
+                        st.caption(f"📁 {data['location']}/{data['filename']}")
+                    else:
+                        st.error("❌ Export failed")
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)[:50]}")
+
+    try:
+        df = pd.read_sql(text("SELECT signal_id, symbol, source, direction, conviction_tier, total_score, status FROM signals WHERE status=:status ORDER BY total_score DESC LIMIT 10"), engine, params={"status": "ACTIVE"})
+        if not df.empty:
+            st.dataframe(df)
+        else:
+            st.info("No active signals")
+    except Exception as e:
+        st.error(f"Error loading signals: {e}")
+    
+    st.subheader("Open Positions")
+    try:
+        df = pd.read_sql(text("SELECT position_id, symbol, direction, shares, entry_price, conviction_tier, status FROM positions WHERE status=:status ORDER BY entry_date DESC LIMIT 10"), engine, params={"status": "OPEN"})
+        if not df.empty:
+            st.dataframe(df)
+        else:
+            st.info("No open positions")
+    except Exception as e:
+        st.error(f"Error loading positions: {e}")
+
+elif page == "Performance":
+    st.header("📈 Performance vs. Market")
+    
+    # LIVE P&L SUMMARY
+    st.subheader("💰 Live Portfolio Performance")
+    
+    try:
+        positions_df = pd.read_sql(text("""
+            SELECT symbol, shares, entry_price, entry_date, conviction_tier
+            FROM positions WHERE status = :status
+        """), engine, params={"status": "OPEN"})
+        
+        if not positions_df.empty:
+            symbols = positions_df["symbol"].unique().tolist()
+            current_prices = {}
+            
+            with st.spinner("Fetching live prices..."):
+                for symbol in symbols[:10]:  # Limit to prevent timeout
+                    try:
+                        ticker = yf.Ticker(symbol)
+                        info = ticker.history(period="1d")
+                        if not info.empty:
+                            current_prices[symbol] = info["Close"].iloc[-1]
+                    except:
+                        pass
+            
+            positions_df["current_price"] = positions_df["symbol"].map(current_prices)
+            positions_df["entry_value"] = positions_df["shares"] * positions_df["entry_price"]
+            positions_df["current_value"] = positions_df["shares"] * positions_df["current_price"]
+            positions_df["unrealized_pnl"] = positions_df["current_value"] - positions_df["entry_value"]
+            positions_df["return_pct"] = (positions_df["unrealized_pnl"] / positions_df["entry_value"]) * 100
+            
+            total_unrealized = positions_df["unrealized_pnl"].sum()
+            total_entry = positions_df["entry_value"].sum()
+            total_current = positions_df["current_value"].sum()
+            total_return_pct = (total_unrealized / total_entry * 100) if total_entry > 0 else 0
+            
+            winning = len(positions_df[positions_df["return_pct"] > 0])
+            losing = len(positions_df[positions_df["return_pct"] < 0])
+            win_rate = (winning / len(positions_df) * 100) if len(positions_df) > 0 else 0
+            
+            col1, col2, col3, col4, col5 = st.columns(5)
+            
+            with col1:
+                st.metric("Total Value", f"${total_current:,.0f}", f"${total_unrealized:+,.0f}")
+            
+            with col2:
+                st.metric("Unrealized P&L", f"${total_unrealized:,.2f}", f"{total_return_pct:+.2f}%")
+            
+            with col3:
+                st.metric("Win Rate", f"{win_rate:.1f}%", f"{winning}W / {losing}L")
+            
+            with col4:
+                avg_win = positions_df[positions_df["return_pct"] > 0]["return_pct"].mean() if winning > 0 else 0
+                st.metric("Avg Winner", f"+{avg_win:.2f}%")
+            
+            with col5:
+                avg_loss = positions_df[positions_df["return_pct"] < 0]["return_pct"].mean() if losing > 0 else 0
+                st.metric("Avg Loser", f"{avg_loss:.2f}%")
+            
+            st.caption("🔄 Live data • Updates on refresh")
+    except Exception as e:
+        st.error(f"Error: {e}")
+    
+    st.divider()
+    
+    # BENCHMARK COMPARISON
+    st.subheader("📊 vs. Market Benchmarks")
+    
+    timeframe = st.radio("Timeframe", ["1 Day", "1 Week", "1 Month", "3 Months"], horizontal=True)
+    
+    days_map = {"1 Day": 1, "1 Week": 7, "1 Month": 30, "3 Months": 90}
+    selected_days = days_map[timeframe]
+    
+    with st.spinner("Loading..."):
+        spy_data = fetch_benchmark_data("SPY", selected_days)
+        qqq_data = fetch_benchmark_data("QQQ", selected_days)
+        gld_data = fetch_benchmark_data("GLD", selected_days)
+        portfolio_data = calculate_portfolio_history(db, selected_days)
+    
+    def normalize_returns(series):
+        if len(series) > 0:
+            return ((series / series.iloc[0]) - 1) * 100
+        return series
+    
+    spy_returns = normalize_returns(spy_data)
+    qqq_returns = normalize_returns(qqq_data)
+    gld_returns = normalize_returns(gld_data)
+    portfolio_returns = normalize_returns(portfolio_data)
+    
+    # Chart
+    fig = go.Figure()
+    
+    if len(portfolio_returns) > 0:
+        fig.add_trace(go.Scatter(x=portfolio_returns.index, y=portfolio_returns.values, mode="lines", name="Dojo", line=dict(color="blue", width=3)))
+    
+    if len(spy_returns) > 0:
+        fig.add_trace(go.Scatter(x=spy_returns.index, y=spy_returns.values, mode="lines", name="S&P 500", line=dict(color="green", width=2, dash="dash")))
+    
+    if len(qqq_returns) > 0:
+        fig.add_trace(go.Scatter(x=qqq_returns.index, y=qqq_returns.values, mode="lines", name="Nasdaq", line=dict(color="purple", width=2, dash="dash")))
+    
+    if len(gld_returns) > 0:
+        fig.add_trace(go.Scatter(x=gld_returns.index, y=gld_returns.values, mode="lines", name="Gold", line=dict(color="gold", width=2, dash="dot")))
+    
+    fig.update_layout(title=f"Performance - {timeframe}", xaxis_title="Date", yaxis_title="Return (%)", hovermode="x unified", height=500)
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    st.caption("📊 Market data: [Alpaca Markets (IEX)](https://alpaca.markets) • Portfolio data: Live paper trading")
+    
+    # Returns
+    col1, col2, col3, col4 = st.columns(4)
+    
+    portfolio_return = float(portfolio_returns.iloc[-1]) if len(portfolio_returns) > 0 else 0
+    spy_return = float(spy_returns.iloc[-1]) if len(spy_returns) > 0 else 0
+    qqq_return = float(qqq_returns.iloc[-1]) if len(qqq_returns) > 0 else 0
+    gld_return = float(gld_returns.iloc[-1]) if len(gld_returns) > 0 else 0
+    
+    with col1:
+        st.metric("Dojo", f"{portfolio_return:.2f}%")
+    with col2:
+        st.metric("S&P 500", f"{spy_return:.2f}%")
+    with col3:
+        st.metric("Nasdaq", f"{qqq_return:.2f}%")
+    with col4:
+        st.metric("Gold", f"{gld_return:.2f}%")
+    
+    # Alpha
+    st.subheader("🎯 Alpha")
+    
+    with st.expander("What is Alpha?"):
+        st.write("**Alpha = Your Return - Market Return**")
+        st.write("Positive = beating market | Negative = underperforming")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        alpha_spy = portfolio_return - spy_return
+        st.metric("vs. S&P", f"{alpha_spy:+.2f}%", delta="Beating" if alpha_spy > 0 else "Behind", delta_color="normal" if alpha_spy > 0 else "inverse")
+    
+    with col2:
+        alpha_qqq = portfolio_return - qqq_return
+        st.metric("vs. Nasdaq", f"{alpha_qqq:+.2f}%", delta="Beating" if alpha_qqq > 0 else "Behind", delta_color="normal" if alpha_qqq > 0 else "inverse")
+    
+    with col3:
+        alpha_gld = portfolio_return - gld_return
+        st.metric("vs. Gold", f"{alpha_gld:+.2f}%", delta="Beating" if alpha_gld > 0 else "Behind", delta_color="normal" if alpha_gld > 0 else "inverse")
+    
+    st.divider()
+    
+    # Top/Bottom
+    st.subheader("💰 Unrealized Gains/Losses")
+    
+    if "positions_df" in locals() and not positions_df.empty:
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write("**🟢 Top 5 Gainers**")
+            top = positions_df.nlargest(5, "return_pct")[["symbol", "return_pct", "unrealized_pnl"]]
+            st.dataframe(top)
+        
+        with col2:
+            st.write("**🔴 Top 5 Losers**")
+            bottom = positions_df.nsmallest(5, "return_pct")[["symbol", "return_pct", "unrealized_pnl"]]
+            st.dataframe(bottom)
+
+elif page == "Signals":
+    st.header("Signals")
+    
+    status_filter = st.selectbox("Status", ["All", "ACTIVE", "PENDING", "REJECTED", "EXPIRED"])
+    tier_filter = st.selectbox("Tier", ["All", "S", "A", "B", "C"])
+    
+    query = "SELECT signal_id, symbol, source, direction, conviction_tier, total_score, status FROM signals WHERE 1=1"
+    params = {}
+    if status_filter != "All":
+        query += " AND status=:status"
+        params["status"] = status_filter
+    if tier_filter != "All":
+        query += " AND conviction_tier=:tier"
+        params["tier"] = tier_filter
+    query += " ORDER BY total_score DESC LIMIT 100"
+    
+    try:
+        df = pd.read_sql(text(query), engine, params=params)
+        if not df.empty:
+            st.dataframe(df)
+        else:
+            st.info("No signals found")
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+elif page == "Positions":
+    st.header("Positions")
+    
+    status_filter = st.selectbox("Status", ["All", "OPEN", "CLOSED"])
+    
+    query = "SELECT position_id, symbol, direction, shares, entry_price, exit_price, realized_pnl, status FROM positions WHERE 1=1"
+    params = {}
+    if status_filter != "All":
+        query += " AND status=:status"
+        params["status"] = status_filter
+    query += " ORDER BY entry_date DESC LIMIT 100"
+    
+    try:
+        df = pd.read_sql(text(query), engine, params=params)
+        if not df.empty:
+            st.dataframe(df)
+        else:
+            st.info("No positions found")
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+db.close()

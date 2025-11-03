@@ -1,0 +1,43 @@
+# Portfolio-level Risk Constraints
+portfolio:
+  starting_capital: 100000
+  max_cash_deployed: 0.90
+  min_cash_reserve: 0.10
+
+position_sizing:
+  max_position_size_pct: 0.10
+  max_symbol_exposure_pct: 0.15
+  max_sector_exposure_pct: 0.30
+  
+  sizing_tiers:
+    S: 0.08
+    A: 0.05
+    B: 0.03
+    C: 0.01
+
+drawdown_limits:
+  max_daily_drawdown_pct: 0.03
+  max_portfolio_drawdown_pct: 0.15
+
+correlation_limits:
+  max_positions_same_sector: 5
+  max_correlation_to_spy: 0.85
+
+stop_loss:
+  default_stop_loss_pct: 0.07
+  tier_adjustments:
+    S: 0.10
+    A: 0.08
+    B: 0.07
+    C: 0.05
+
+signal_expiry_days:
+  insider: 90
+  stock_act: 45
+  13f: 120
+  options: 30
+
+execution:
+  max_orders_per_day: 20
+  max_slippage_tolerance_pct: 0.02
+  min_liquidity_avg_volume: 100000

@@ -1,0 +1,108 @@
+"""Streamlit dashboard for Dojo Allocator."""
+import streamlit as st
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+import pandas as pd
+from config.settings import get_settings
+
+settings = get_settings()
+engine = create_engine(settings.DATABASE_URL)
+Session = sessionmaker(bind=engine)
+
+st.set_page_config(page_title="Dojo Allocator", layout="wide")
+st.title("🥋 Dojo Allocator Dashboard")
+
+# Sidebar
+st.sidebar.title("Navigation")
+page = st.sidebar.radio("Go to", ["Overview", "Signals", "Positions"])
+
+db = Session()
+
+if page == "Overview":
+    st.header("System Overview")
+    
+    # Metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        total_signals = db.execute(text("SELECT COUNT(*) FROM signals")).scalar()
+        st.metric("Total Signals", total_signals)
+    
+    with col2:
+        active_signals = db.execute(text("SELECT COUNT(*) FROM signals WHERE status='ACTIVE'")).scalar()
+        st.metric("Active Signals", active_signals)
+    
+    with col3:
+        open_positions = db.execute(text("SELECT COUNT(*) FROM positions WHERE status='OPEN'")).scalar()
+        st.metric("Open Positions", open_positions)
+    
+    with col4:
+        closed_positions = db.execute(text("SELECT COUNT(*) FROM positions WHERE status='CLOSED'")).scalar()
+        st.metric("Closed Positions", closed_positions)
+    
+    st.subheader("Active Signals")
+    try:
+        df = pd.read_sql(text("SELECT signal_id, symbol, source, direction, conviction_tier, total_score, status FROM signals WHERE status='ACTIVE' ORDER BY total_score DESC LIMIT 10"), engine)
+        if not df.empty:
+            st.dataframe(df)
+        else:
+            st.info("No active signals")
+    except Exception as e:
+        st.error(f"Error loading signals: {e}")
+    
+    st.subheader("Open Positions")
+    try:
+        df = pd.read_sql(text("SELECT position_id, symbol, direction, shares, entry_price, conviction_tier, status FROM positions WHERE status='OPEN' ORDER BY entry_date DESC LIMIT 10"), engine)
+        if not df.empty:
+            st.dataframe(df)
+        else:
+            st.info("No open positions")
+    except Exception as e:
+        st.error(f"Error loading positions: {e}")
+
+elif page == "Signals":
+    st.header("Signals")
+    
+    # Filters
+    status_filter = st.selectbox("Status", ["All", "ACTIVE", "PENDING", "REJECTED", "EXPIRED"])
+    tier_filter = st.selectbox("Tier", ["All", "S", "A", "B", "C"])
+    
+    # Build query
+    query = "SELECT signal_id, symbol, source, direction, conviction_tier, total_score, status FROM signals WHERE 1=1"
+    if status_filter != "All":
+        query += f" AND status='{status_filter}'"
+    if tier_filter != "All":
+        query += f" AND conviction_tier='{tier_filter}'"
+    query += " ORDER BY total_score DESC LIMIT 100"
+    
+    try:
+        df = pd.read_sql(text(query), engine)
+        if not df.empty:
+            st.dataframe(df)
+        else:
+            st.info("No signals found")
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+elif page == "Positions":
+    st.header("Positions")
+    
+    # Filters
+    status_filter = st.selectbox("Status", ["All", "OPEN", "CLOSED", "FORCE_CLOSED"])
+    
+    # Build query
+    query = "SELECT position_id, symbol, direction, shares, entry_price, exit_price, realized_pnl, return_pct, status, conviction_tier FROM positions WHERE 1=1"
+    if status_filter != "All":
+        query += f" AND status='{status_filter}'"
+    query += " ORDER BY entry_date DESC LIMIT 100"
+    
+    try:
+        df = pd.read_sql(text(query), engine)
+        if not df.empty:
+            st.dataframe(df)
+        else:
+            st.info("No positions found")
+    except Exception as e:
+        st.error(f"Error: {e}")
+
+db.close()

@@ -1,0 +1,37 @@
+#!/bin/bash
+# Database backup to Google Drive
+
+DRIVE_PATH="$HOME/Library/CloudStorage/GoogleDrive-zg@kromaprojekts.com/My Drive"
+BACKUP_DIR="$DRIVE_PATH/Dojo Allocator Files/Backups"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_FILE="$BACKUP_DIR/dojo_backup_$TIMESTAMP.sql"
+
+mkdir -p "$BACKUP_DIR"
+
+echo "🔄 Backing up to Google Drive..."
+
+docker exec dojo_allocator-postgres-1 pg_dump -U dojo dojo_allocator > "$BACKUP_FILE"
+
+if [ $? -eq 0 ]; then
+    gzip "$BACKUP_FILE"
+    COMPRESSED="${BACKUP_FILE}.gz"
+    SIZE=$(du -h "$COMPRESSED" | cut -f1)
+    FILENAME=$(basename "$COMPRESSED")
+    
+    echo "✅ Backup complete!"
+    echo "📁 Location: Dojo Allocator Files/Backups/$FILENAME"
+    echo "📊 Size: $SIZE"
+    echo "☁️  Syncing to Google Drive cloud..."
+    
+    # Keep last 30 backups
+    ls -t "$BACKUP_DIR"/dojo_backup_*.sql.gz 2>/dev/null | tail -n +31 | xargs rm -f 2>/dev/null
+    
+    COUNT=$(ls "$BACKUP_DIR"/dojo_backup_*.sql.gz 2>/dev/null | wc -l | tr -d ' ')
+    echo "📦 Total backups in Drive: $COUNT"
+    
+    # Open Finder to show backup
+    open "$BACKUP_DIR"
+else
+    echo "❌ Backup failed"
+    exit 1
+fi

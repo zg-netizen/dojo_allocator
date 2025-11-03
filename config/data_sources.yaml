@@ -1,0 +1,55 @@
+# Data Source Configurations
+sec_edgar:
+  base_url: "https://www.sec.gov"
+  user_agent: "DojoAllocator/1.0 (zg@kromaprojekts.com)"
+  rate_limit_requests_per_second: 10
+  forms:
+    - form_4
+    - form_13f
+  lookback_days: 30
+
+stock_act:
+  base_url: "https://house-stock-watcher-data.s3-us-west-2.amazonaws.com"
+  update_frequency_hours: 24
+  lookback_days: 90
+
+options_flow:
+  provider: "quiverquant"
+  api_key_env: "QUIVER_API_KEY"
+  base_url: "https://api.quiverquant.com"
+  min_premium_threshold: 100000
+  min_unusual_activity_score: 0.7
+
+macro_indicators:
+  fred:
+    base_url: "https://api.stlouisfed.org/fred"
+    api_key_env: "FRED_API_KEY"
+    series:
+      - DGS10
+      - VIXCLS
+      - UNRATE
+      - CPIAUCSL
+    update_frequency_hours: 24
+  cftc:
+    base_url: "https://publicreporting.cftc.gov"
+    report_types:
+      - commitments_of_traders
+    update_frequency_days: 7
+
+brokers:
+  paper:
+    enabled: true
+    starting_cash: 100000
+    simulate_slippage: true
+    slippage_bps: 5
+  interactive_brokers:
+    enabled: false
+    host: "127.0.0.1"
+    port: 7497
+    client_id: 1
+    account_id_env: "IB_ACCOUNT_ID"
+  alpaca:
+    enabled: false
+    base_url: "https://paper-api.alpaca.markets"
+    api_key_env: "ALPACA_API_KEY"
+    api_secret_env: "ALPACA_API_SECRET"
